@@ -10,6 +10,12 @@
 #include "quad.h"
 #include "texture.h"
 
+// ---------------------------------------------------
+// Windows API (必ず NOMINMAX を定義してからインクルード)
+// ---------------------------------------------------
+#define NOMINMAX
+#include <windows.h>
+
 // 必須ヘッダー
 #include <d3d11.h>          // DirectX 11 本体
 #include <d3dcompiler.h>    // HLSLシェーダーのコンパイル用
@@ -29,6 +35,44 @@ using Microsoft::WRL::ComPtr;
 
 // DirectX API の呼び出し結果をチェックするマクロ
 #define CheckHR(hr) if (FAILED(hr)) { throw std::runtime_error("DirectX Error!"); }
+
+// ---------------------------------------------------
+// リアルタイム・FPS視点カメラ
+// ---------------------------------------------------
+struct FpsCamera {
+    point3 pos;
+    double yaw;
+    double pitch;
+    double vfov;
+    double defocus_angle;
+    double focus_dist;
+
+    FpsCamera(point3 lookfrom, point3 lookat, double fov = 60.0) {
+        pos = lookfrom;
+        vfov = fov;
+        defocus_angle = 0.0f;
+        focus_dist = 5.0f;
+
+        vec3 dir = unit_vector(lookat - lookfrom);
+        pitch = radians_to_degrees(std::asin(dir.y()));
+        yaw = radians_to_degrees(std::atan2(dir.z(), dir.x()));
+    }
+
+    vec3 get_forward() const {
+        double r_pitch = degrees_to_radians(pitch);
+        double r_yaw = degrees_to_radians(yaw);
+        return unit_vector(vec3(
+            std::cos(r_pitch) * std::cos(r_yaw),
+            std::sin(r_pitch),
+            std::cos(r_pitch) * std::sin(r_yaw)
+        ));
+    }
+
+    vec3 get_right() const {
+        return unit_vector(cross(get_forward(), vec3(0, 1, 0)));
+    }
+};
+
 
 // Y軸周りの3D回転ヘルパ
 inline vec3 rotate_vec_y(const vec3& v, double angle_deg) {
@@ -1117,39 +1161,351 @@ int run_gpu_renderer(const SceneConfig sc) {
     return 0;
  }
 
-int main() {
-    try {
-        // レンダリングしたいシーンを選択
-        // 1: Bouncing Spheres
-        // 2: Checkered Spheres
-        // 3: Earth
-        // 4: Perlin Spheres
-        // 5: Quads
-        // 6: Sample Light
-        // 7: Cornell Box
-        // 8: Cornell Smoke
-        // 9: Final Scene (Preview 250 samples)
-        // 10: Final Scene (High Detail 10,000 samples)
-        int scene_id = 12;
+// キー入力とマウス状態
+bool g_keys[256] = {};
+bool g_mouse_down = false;
+POINT g_last_mouse = {};
 
-        SceneConfig sc;
-        switch (scene_id) {
-        case 1:  sc = scene_bouncing_spheres(); break;
-        case 2:  sc = scene_checkered_spheres(); break;
-        case 3:  sc = scene_earth(); break;
-        case 4:  sc = scene_perlin_spheres(); break;
-        case 5:  sc = scene_quads(); break;
-        case 6:  sc = scene_sample_light(); break;
-        case 7:  sc = scene_cornell_box(); break;
-        case 8:  sc = scene_cornell_smoke(); break;
-        case 9:  sc = scene_final_scene(0); break;
-        case 10: sc = scene_final_scene(1);  break;
-        case 11: sc = scene_mirror_house(0); break;
-        case 12: sc = scene_mirror_house(1); break;
-        default: sc = scene_final_scene(2); break;
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (wParam < 256) g_keys[wParam] = true;
+        if (wParam == VK_ESCAPE) PostQuitMessage(0);
+        return 0;
+    case WM_KEYUP:
+        if (wParam < 256) g_keys[wParam] = false;
+        return 0;
+    case WM_LBUTTONDOWN:
+    case WM_RBUTTONDOWN:
+        g_mouse_down = true;
+        GetCursorPos(&g_last_mouse);
+        SetCapture(hWnd);
+        return 0;
+    case WM_LBUTTONUP:
+    case WM_RBUTTONUP:
+        g_mouse_down = false;
+        ReleaseCapture();
+        return 0;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+// DisplayCS用の定数バッファ
+struct DisplayBufferData {
+    int total_samples;
+    float pad[3];
+};
+
+int run_realtime_renderer(const SceneConfig& sc) {
+    // 1.Win32 ウィンドウの作成
+    HINSTANCE hInstance = GetModuleHandle(nullptr);
+    WNDCLASSEXW wc = { sizeof(WNDCLASSEXW), CS_CLASSDC, WndProc, 0, 0, hInstance, nullptr, nullptr,  nullptr,  nullptr, L"RayTracerWindowClass", nullptr };
+    RegisterClassExW(&wc);
+
+    RECT wr = { 0,0,(LONG)sc.image_width, (LONG)sc.image_height };
+    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+
+    HWND hWnd = CreateWindowW(
+        wc.lpszClassName, L"Real-Time GPU Ray Tracer [Mirror House]",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+        CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
+        nullptr, nullptr, wc.hInstance, nullptr
+    );
+
+    ShowWindow(hWnd, SW_SHOWDEFAULT);
+    UpdateWindow(hWnd);
+
+    // 2. DirectX 11 デバイスとスワップチェインの作成
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount = 1;
+    sd.BufferDesc.Width = sc.image_width;
+    sd.BufferDesc.Height = sc.image_height;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_UNORDERED_ACCESS;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;    // 【必須】1を指定（0だと初期化が失敗する）
+    sd.Windowed = TRUE;
+
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    ComPtr<IDXGISwapChain> swapChain;
+
+    D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_1,  D3D_FEATURE_LEVEL_11_0 };
+    UINT creationFlags = 0;
+#ifdef _DEBUG
+    creationFlags |= D3D11_CREATE_DEVICE_DEBUG;
+#endif
+
+    CheckHR(D3D11CreateDeviceAndSwapChain(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, creationFlags,
+        featureLevels, ARRAYSIZE(featureLevels), D3D11_SDK_VERSION,
+        &sd, &swapChain, &device, nullptr, &context
+    ));
+
+    // バックバッファのUAVを取得
+    ComPtr<ID3D11Texture2D> backBuffer;
+    CheckHR(swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), &backBuffer));
+    D3D11_UNORDERED_ACCESS_VIEW_DESC bbUavDesc = {};
+    bbUavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    bbUavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    ComPtr<ID3D11UnorderedAccessView> backBufferUAV;
+    CheckHR(device->CreateUnorderedAccessView(backBuffer.Get(), &bbUavDesc, &backBufferUAV));
+
+    // 3.ComputeShaderのコンパイル
+    UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
+    ComPtr<ID3DBlob> blobRay, blobDisplay, errorBlob;
+
+    // レイトレ本体
+    CheckHR(D3DCompileFromFile(L"shader/RayTracingCS.hlsl", nullptr, nullptr, "CSMain", "cs_5_0", compileFlags, 0, &blobRay, &errorBlob));
+    ComPtr<ID3D11ComputeShader> rayShader;
+    CheckHR(device->CreateComputeShader(blobRay->GetBufferPointer(), blobRay->GetBufferSize(), nullptr, &rayShader));
+
+    // 表示用ポストプロセス
+    CheckHR(D3DCompileFromFile(L"shader/DisplayCS.hlsl", nullptr, nullptr, "CSMain", "cs_5_0", compileFlags, 0, &blobDisplay, &errorBlob));
+    ComPtr<ID3D11ComputeShader> displayShader;
+    CheckHR(device->CreateComputeShader(blobDisplay->GetBufferPointer(), blobDisplay->GetBufferSize(), nullptr, &displayShader));
+
+    // 4. シーンバッファとBVHの構築 (既存ロジックを流用)
+    std::vector<PrimitiveRef> prim_refs;
+    for (size_t i = 0; i < sc.spheres.size(); ++i)
+        prim_refs.emplace_back(0, static_cast<int>(i), compute_sphere_aabb(sc.spheres[i]));
+    for (size_t i = 0; i < sc.quads.size(); ++i)
+        prim_refs.emplace_back(1, static_cast<int>(i), compute_quad_aabb(sc.quads[i]));
+    for (size_t i = 0; i < sc.volumes.size(); ++i)
+        prim_refs.emplace_back(2, static_cast<int>(i), compute_volume_aabb(sc.volumes[i]));
+
+    std::vector<GpuBvhNode> bvh_nodes;
+    build_flat_bvh_generic(prim_refs, 0, static_cast<int>(prim_refs.size()), bvh_nodes);
+
+    ComPtr<ID3D11Buffer> sphereBuffer, bvhBuffer, quadBuffer, volBuffer;
+    ComPtr<ID3D11ShaderResourceView> sphereSRV, bvhSRV, quadSRV, volSRV;
+    create_structured_buffer_and_srv(device.Get(), sc.spheres, sphereBuffer, sphereSRV);
+    create_structured_buffer_and_srv(device.Get(), bvh_nodes, bvhBuffer, bvhSRV);
+    create_structured_buffer_and_srv(device.Get(), sc.quads, quadBuffer, quadSRV);
+    create_structured_buffer_and_srv(device.Get(), sc.volumes, volBuffer, volSRV);
+
+    ComPtr<ID3D11Texture2D> imageTex;
+    ComPtr<ID3D11ShaderResourceView> imageSRV;
+    create_image_texture_and_srv(device.Get(), sc.texture_filename, imageTex, imageSRV);
+
+    D3D11_SAMPLER_DESC sampDesc = {};
+    sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+    ComPtr<ID3D11SamplerState> linearSampler;
+    CheckHR(device->CreateSamplerState(&sampDesc, &linearSampler));
+
+    // 5.蓄積テクスチャ（AccumTexture:UAVかつSRVとして使用）
+    D3D11_TEXTURE2D_DESC accumDesc = {};
+    accumDesc.Width = sc.image_width;
+    accumDesc.Height = sc.image_height;
+    accumDesc.MipLevels = 1;
+    accumDesc.ArraySize = 1;
+    accumDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    accumDesc.SampleDesc.Count = 1;
+    accumDesc.Usage = D3D11_USAGE_DEFAULT;
+    accumDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+    ComPtr<ID3D11Texture2D> accumTexture;
+    CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &accumTexture));
+    ComPtr<ID3D11UnorderedAccessView> accumUAV;
+    CheckHR(device->CreateUnorderedAccessView(accumTexture.Get(), nullptr, &accumUAV));
+    ComPtr<ID3D11ShaderResourceView> accumSRV;
+    CheckHR(device->CreateShaderResourceView(accumTexture.Get(), nullptr, &accumSRV));
+
+    // 6. 定数バッファの作成
+    CameraBufferData cbData = {};
+    sc.background.copy_to(cbData.background);
+    cbData.max_depth = sc.max_depth;
+
+    // 光源ターゲットの登録
+    int target_count = 0;
+    for (size_t i = 0; i < sc.quads.size() && target_count < 4; ++i) {
+        if (sc.quads[i].mat.type == 3) {
+            cbData.light_target_data[target_count][0] = 1;
+            cbData.light_target_data[target_count][1] = static_cast<int>(i);
+            target_count++;
+        }
+    }
+    cbData.num_light_targets = target_count;
+
+    D3D11_BUFFER_DESC cbDesc = { sizeof(CameraBufferData), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+    ComPtr<ID3D11Buffer> cameraBuffer;
+    CheckHR(device->CreateBuffer(&cbDesc, nullptr, &cameraBuffer));
+
+    DisplayBufferData dispData = {};
+    D3D11_BUFFER_DESC dispDesc = { sizeof(DisplayBufferData), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+    ComPtr<ID3D11Buffer> displayBuffer;
+    CheckHR(device->CreateBuffer(&dispDesc, nullptr, &displayBuffer));
+
+    // 7.インタラクティブ・カメラの初期化
+    FpsCamera camera(sc.lookfrom, sc.lookat, sc.vfov);
+    camera.defocus_angle = sc.defocus_angle;
+    camera.focus_dist = sc.focus_dist;
+
+    UINT dispatchX = (sc.image_width + 15) / 16;
+    UINT dispatchY = (sc.image_height + 15) / 16;
+
+    int pass_index = 0;
+    int total_accum_samples = 0;
+    const int samples_per_frame = 1;     // リアルタイム性重視で1フレームあたり1サンプル
+    
+    auto last_time = std::chrono::high_resolution_clock::now();
+    int fps_frame_count = 0;
+    double fps_timer = 0.0;
+
+    // ---------------------------------------------------
+    // メインメッセージループ
+    // ---------------------------------------------------
+    MSG msg = {};
+    while (msg.message != WM_QUIT) {
+        if (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+            continue;
         }
 
-        return run_gpu_renderer(sc);
+        auto current_time = std::chrono::high_resolution_clock::now();
+        double dt = std::chrono::duration<double>(current_time - last_time).count();
+        last_time = current_time;
+
+        fps_timer += dt;
+        fps_frame_count++;
+        if (fps_timer >= 0.5) {
+            double fps = fps_frame_count / fps_timer;
+            std::string title = "Real-Time Ray Tracer | Samples: " + std::to_string(total_accum_samples) + " | " + std::to_string((int)fps) + " FPS";
+            SetWindowTextA(hWnd, title.c_str());
+            fps_timer = 0.0f;
+            fps_frame_count = 0;
+        }
+
+        // カメラ入力しょろい
+        bool camera_moved = false;
+        double speed = 6.0 * dt;
+
+        vec3 fwd = camera.get_forward();
+        vec3 right = camera.get_right();
+
+        if (g_keys['W']) { camera.pos = camera.pos + fwd * speed; camera_moved = true; }
+        if (g_keys['S']) { camera.pos = camera.pos - fwd * speed; camera_moved = true; }
+        if (g_keys['D']) { camera.pos = camera.pos + right * speed; camera_moved = true; }
+        if (g_keys['A']) { camera.pos = camera.pos - right * speed; camera_moved = true; }
+        if (g_keys[VK_SPACE]) { camera.pos = camera.pos + vec3(0, 1, 0) * speed, camera_moved = true; }
+        if (g_keys[VK_SHIFT]) { camera.pos = camera.pos - vec3(0, 1, 0) * speed, camera_moved = true; }
+
+        if (g_mouse_down) {
+            POINT cur_mouse;
+            GetCursorPos(&cur_mouse);
+            double dx = cur_mouse.x - g_last_mouse.x;
+            double dy = cur_mouse.y - g_last_mouse.y;
+            g_last_mouse = cur_mouse;
+
+            if (dx != 0 || dy != 0) {
+                camera.yaw += dx * 0.15;
+                camera.pitch = std::clamp(camera.pitch -dy * 0.15, -89.0, 89.0);
+                camera_moved = true;
+            }
+        }
+
+        // カメラが動いたら蓄積リセット
+        if (camera_moved) {
+            pass_index = 0;
+            total_accum_samples = 0;
+        }
+
+        // カメラ定数バッファの再計算
+        auto image_width = static_cast<double>(sc.image_width);
+        auto image_height = static_cast<double>(sc.image_height);
+        auto theta = degrees_to_radians(camera.vfov);
+        auto h = std::tan(theta / 2.0);
+        auto viewport_height = 2.0 * h * camera.focus_dist;
+        auto viewport_width = viewport_height * (image_width / image_height);
+
+        auto w = -camera.get_forward();
+        auto u = unit_vector(cross(vec3(0, 1, 0), w));
+        auto v = cross(w, u);
+
+        auto viewport_u = viewport_width * u;
+        auto viewport_v = viewport_height * -v;
+
+        auto pixel_delta_u = viewport_u / image_width;
+        auto pixel_delta_v = viewport_v / image_height;
+
+        auto viewport_upper_left = camera.pos - (camera.focus_dist * w) - viewport_u / 2.0 - viewport_v / 2.0;
+        auto pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v);
+
+        auto defocus_radius = camera.focus_dist * std::tan(degrees_to_radians(camera.defocus_angle / 2.0));
+        auto defocus_disk_u = u * defocus_radius;
+        auto defocus_disk_v = v * defocus_radius;
+
+        camera.pos.copy_to(cbData.camera_center);
+        pixel00_loc.copy_to(cbData.pixel00_loc);
+        pixel_delta_u.copy_to(cbData.pixel_delta_u);
+        pixel_delta_v.copy_to(cbData.pixel_delta_v);
+        defocus_disk_u.copy_to(cbData.defocus_disk_u);
+        defocus_disk_v.copy_to(cbData.defocus_disk_v);
+        cbData.pass_index = pass_index;
+        cbData.samples_this_pass = samples_per_frame;
+
+        context->UpdateSubresource(cameraBuffer.Get(), 0, nullptr, &cbData, 0, 0);
+
+        // Pass 1:レイトレーシング計算（RayTracingCS）
+        context->CSSetShader(rayShader.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* srvs[] = { sphereSRV.Get(), bvhSRV.Get(), imageSRV.Get(), quadSRV.Get(), volSRV.Get() };
+        context->CSSetShaderResources(0, 5, srvs);
+        ID3D11SamplerState* samplers[] = { linearSampler.Get() };
+        context->CSSetSamplers(0, 1, samplers);
+        ID3D11Buffer* cbs[] = { cameraBuffer.Get() };
+        context->CSSetConstantBuffers(0, 1, cbs);
+        ID3D11UnorderedAccessView* uavs[] = { accumUAV.Get() };
+        context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+
+        context->Dispatch(dispatchX, dispatchY, 1);
+
+        // UAVアンバインド(Pass2でSRVとして読むため)
+        ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
+        context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+
+        pass_index++;
+        total_accum_samples += samples_per_frame;
+
+        // Pass 2:トーンマップ&画面転送（DisplayCS）
+        dispData.total_samples = total_accum_samples;
+        context->UpdateSubresource(displayBuffer.Get(), 0, nullptr, &dispData, 0, 0);
+
+        context->CSSetShader(displayShader.Get(), nullptr, 0);
+        ID3D11ShaderResourceView* dispSrvs[] = { accumSRV.Get() };
+        context->CSSetShaderResources(0, 1, dispSrvs);
+        ID3D11Buffer* dispCbs[] = { displayBuffer.Get() };
+        context->CSSetConstantBuffers(0, 1, dispCbs);
+        ID3D11UnorderedAccessView* bbUavs[] = { backBufferUAV.Get() };
+        context->CSSetUnorderedAccessViews(0, 1, bbUavs, nullptr);
+
+        context->Dispatch(dispatchX, dispatchY, 1);
+
+        // リソース解除
+        context->CSSetShaderResources(0, 1, (ID3D11ShaderResourceView* const*)nullUAV);
+        context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+
+        // 画面フリップ（垂直同期: 1, 即時描画:0）
+        swapChain->Present(1, 0);
+    }
+
+    return 0;
+}
+
+int main() {
+    try {
+        // レンダリングしたいシーンを設定
+        SceneConfig sc = scene_mirror_house(0);
+        return run_realtime_renderer(sc);
     }
     catch (const std::exception& e) {
         std::cerr << "Exception: " << e.what() << std::endl;

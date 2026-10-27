@@ -18,6 +18,10 @@ inline double degrees_to_radians(double degrees) {
     return degrees * pi / 180.0;
 }
 
+inline double radians_to_degrees(double radian) {
+    return radian * 180.0 / pi;
+}
+
 inline double random_double() {
     // Return a random real  in [0,).
     return std::rand() / (RAND_MAX + 1.0);
