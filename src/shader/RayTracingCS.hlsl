@@ -162,8 +162,9 @@ float3 onb_local(ONB onb, float3 a)
     return a.x * onb.u + a.y * onb.v + a.z * onb.w;
 }
 
-// 出力先テクスチャ（UAV:u0 スロットにバインド）
+// 出力先UAVの定義（UAV:u0 WorldPos:u1）
 RWTexture2D<float4> OutputTexture : register(u0);
+RWTexture2D<float4> WorldPosTexture : register(u1);
 // C++から転送された球体バッファ(t0)とBVHノードバッファ(t1)
 StructuredBuffer<Sphere> Spheres : register(t0);
 StructuredBuffer<BvhNode> BvhNodes : register(t1);
@@ -875,6 +876,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     pcg_hash(rng);
 
     float3 pass_color = float3(0.0f, 0.0f, 0.0f);
+    float3 first_hit_pos = float3(0.0f, 0.0f, 0.0f);
     
     // マルチサンプリング（アンチエイリアス）ループ
     for (int s = 0; s < SamplesThisPass; ++s)
@@ -910,6 +912,12 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             HitRecord rec = (HitRecord)0;   // ゼロ初期化
             if (hit_world(cur_ray, 0.001f, 1e9f, rng, rec))
             {
+                // 1回目のバウンス（カメラから直接見える面）の座標を記録
+                if (bounce == 0 && s == 0)
+                {
+                    first_hit_pos = rec.p;
+                }
+                
                 // マテリアルの発光成分を加算
                 sample_color += throughput * emitted(rec);
                 
@@ -1020,4 +1028,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     float3 prev_color = (PassIndex == 0) ? float3(0.0f, 0.0f, 0.0f) : OutputTexture[id.xy].rgb;
     // 線形色（リニアカラー）のまま出力バッファへ書き込む
     OutputTexture[id.xy] = float4(prev_color + pass_color, 1.0f);
+    
+    // ワールド座標の書き込み（カメラ移動・パスリセット時のみ更新すれば十分
+    //if (PassIndex == 0)
+    {
+        WorldPosTexture[id.xy] = float4(first_hit_pos, 1.0f);
+    }
 }

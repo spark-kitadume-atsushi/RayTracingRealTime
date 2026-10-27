@@ -1193,10 +1193,71 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hWnd, msg, wParam, lParam);
 }
 
+// ---------------------------------------------------
+// 4x4 行列とベクトルの簡易ヘルパ
+// ---------------------------------------------------
+struct mat4 {
+    float m[4][4];
+    mat4() { memset(m, 0, sizeof(m)); };
+    static mat4 identity() {
+        mat4 r; r.m[0][0] = 1; r.m[1][1] = 1; r.m[2][2] = 1; r.m[3][3] = 1; return r;
+    }
+
+    // ベクトルとの乗算（投影用）
+    vec3 multipy_point(const vec3& v) const {
+        float x = v.x() * m[0][0] + v.y() * m[1][0] + v.z() * m[2][0] + m[3][0];
+        float y = v.x() * m[0][1] + v.y() * m[1][1] + v.z() * m[2][1] + m[3][1];
+        float z = v.x() * m[0][2] + v.y() * m[1][2] + v.z() * m[2][2] + m[3][2];
+        float w = v.x() * m[0][3] + v.y() * m[1][3] + v.z() * m[2][3] + m[3][3];
+        if (w != 0.0f) { x /= w; y /= w; z /= w; }
+        return vec3(x, y, z);
+    };
+};
+
+// 視点行列（ViewMatrix）の計算
+mat4 look_at_matrix(vec3 eye, vec3 center, vec3 up) {
+    vec3 f = unit_vector(center - eye);
+    vec3 u = unit_vector(up);
+    vec3 s = unit_vector(cross(f, u));
+    u = cross(s, f);
+
+    mat4 r = mat4::identity();
+    r.m[0][0] = s.x(); r.m[1][0] = s.y(); r.m[2][0] = s.z(); r.m[3][0] = -dot(s, eye);
+    r.m[0][1] = u.x(); r.m[1][1] = u.y(); r.m[2][1] = u.z(); r.m[3][1] = -dot(u, eye);
+    r.m[0][2] = f.x(); r.m[1][2] = f.y(); r.m[2][2] = f.z(); r.m[3][2] = -dot(f, eye);
+    return r;
+}
+
+// 投影行列(Projection Matrix)の計算
+mat4 perspective_matrix(double vfov, double aspect, double zNear, double zFar) {
+    double tanHalfFovy = std::tan(degrees_to_radians(vfov) / 2.0);
+    mat4 r;
+    r.m[0][0] = static_cast<float>(1.0 / (aspect * tanHalfFovy));
+    r.m[1][1] = static_cast<float>(1.0 / tanHalfFovy);
+    r.m[2][2] = static_cast<float>(zFar / (zFar - zNear));
+    r.m[2][3] = 1.0f;
+    r.m[3][2] = static_cast<float>(-(zFar * zNear) / (zFar - zNear));
+    return r;
+}
+
+// 行列の乗算
+mat4 multiply_matrix(const mat4& a, const mat4& b) {
+    mat4 r;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            r.m[i][j] = a.m[i][0] * b.m[0][j] + a.m[i][1] * b.m[1][j] +
+                        a.m[i][2] * b.m[2][j] + a.m[i][3] * b.m[3][j];
+        }
+    }
+    return r;
+}
+
 // DisplayCS用の定数バッファ
 struct DisplayBufferData {
     int total_samples;
-    float pad[3];
+    int is_camera_moving;   // カメラ移動中
+    float pad[2];
+    mat4 view_proj_prev;    // 前フレームのView-Projection行列
 };
 
 int run_realtime_renderer(const SceneConfig& sc) {
@@ -1313,12 +1374,30 @@ int run_realtime_renderer(const SceneConfig& sc) {
     accumDesc.Usage = D3D11_USAGE_DEFAULT;
     accumDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
-    ComPtr<ID3D11Texture2D> accumTexture;
+    ComPtr<ID3D11Texture2D> accumTexture, worldPosTexture;
+    ComPtr<ID3D11UnorderedAccessView> accumUAV, worldPosUAV;
+    ComPtr<ID3D11ShaderResourceView> accumSRV, worldPosSRV;
+
     CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &accumTexture));
-    ComPtr<ID3D11UnorderedAccessView> accumUAV;
     CheckHR(device->CreateUnorderedAccessView(accumTexture.Get(), nullptr, &accumUAV));
-    ComPtr<ID3D11ShaderResourceView> accumSRV;
     CheckHR(device->CreateShaderResourceView(accumTexture.Get(), nullptr, &accumSRV));
+
+    // ワールド座標G-Buffer用（RayTracingCSで書きこっみ、DisplayCSで読み込み）
+    CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &worldPosTexture));
+    CheckHR(device->CreateUnorderedAccessView(worldPosTexture.Get(), nullptr, &worldPosUAV));
+    CheckHR(device->CreateShaderResourceView(worldPosTexture.Get(), nullptr, &worldPosSRV));
+
+    // 履歴バッファを2枚作成
+    ComPtr<ID3D11Texture2D> historyTextures[2];
+    ComPtr<ID3D11ShaderResourceView> historySRVs[2];
+    ComPtr<ID3D11UnorderedAccessView> historyUAVs[2];
+    for (int i = 0; i < 2; i++) {
+        CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &historyTextures[i]));
+        CheckHR(device->CreateShaderResourceView(historyTextures[i].Get(), nullptr, &historySRVs[i]));
+        CheckHR(device->CreateUnorderedAccessView(historyTextures[i].Get(), nullptr, &historyUAVs[i]));
+    }
+    int history_read_idx = 0;
+    int history_write_idx = 1;
 
     // 6. 定数バッファの作成
     CameraBufferData cbData = {};
@@ -1355,12 +1434,21 @@ int run_realtime_renderer(const SceneConfig& sc) {
 
     int pass_index = 0;
     int total_accum_samples = 0;
-    const int samples_per_frame = 1;     // リアルタイム性重視で1フレームあたり1サンプル
+    const int samples_per_frame = 2;     // リアルタイム性重視で1フレームあたり1サンプル
     
     auto last_time = std::chrono::high_resolution_clock::now();
     int fps_frame_count = 0;
     double fps_timer = 0.0;
 
+    // ---------------------------------------------------
+    // パイプライン共通ステートの事前バインド
+    // ---------------------------------------------------
+    // linearSampler は全パス・全フレームで共通してスロット0を使うため、ループ前で1度だけセット
+    ID3D11SamplerState* samplers[] = { linearSampler.Get() };
+    context->CSSetSamplers(0, 1, samplers);
+
+    mat4 view_proj_current = mat4::identity();
+    mat4 view_proj_previous = mat4::identity();
     // ---------------------------------------------------
     // メインメッセージループ
     // ---------------------------------------------------
@@ -1386,7 +1474,7 @@ int run_realtime_renderer(const SceneConfig& sc) {
             fps_frame_count = 0;
         }
 
-        // カメラ入力しょろい
+        // カメラ入力処理
         bool camera_moved = false;
         double speed = 6.0 * dt;
 
@@ -1413,6 +1501,13 @@ int run_realtime_renderer(const SceneConfig& sc) {
                 camera_moved = true;
             }
         }
+
+        // 行列の計算
+        vec3 eye(camera.pos.x(), camera.pos.y(), camera.pos.z());
+        vec3 center = eye + fwd;
+        mat4 view = look_at_matrix(eye, center, vec3(0, 1, 0));
+        mat4 proj = perspective_matrix(camera.vfov, (double)sc.image_width / sc.image_height, 0.1, 1000.0);
+        view_proj_current = multiply_matrix(view, proj);
 
         // カメラが動いたら蓄積リセット
         if (camera_moved) {
@@ -1460,42 +1555,57 @@ int run_realtime_renderer(const SceneConfig& sc) {
         context->CSSetShader(rayShader.Get(), nullptr, 0);
         ID3D11ShaderResourceView* srvs[] = { sphereSRV.Get(), bvhSRV.Get(), imageSRV.Get(), quadSRV.Get(), volSRV.Get() };
         context->CSSetShaderResources(0, 5, srvs);
-        ID3D11SamplerState* samplers[] = { linearSampler.Get() };
-        context->CSSetSamplers(0, 1, samplers);
+
         ID3D11Buffer* cbs[] = { cameraBuffer.Get() };
         context->CSSetConstantBuffers(0, 1, cbs);
-        ID3D11UnorderedAccessView* uavs[] = { accumUAV.Get() };
-        context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+
+        // UAVにworldPosUAVを追加（u1スロット）
+        ID3D11UnorderedAccessView* rayUavs[] = { accumUAV.Get(), worldPosUAV.Get()};
+        context->CSSetUnorderedAccessViews(0, 2, rayUavs, nullptr);
 
         context->Dispatch(dispatchX, dispatchY, 1);
 
         // UAVアンバインド(Pass2でSRVとして読むため)
-        ID3D11UnorderedAccessView* nullUAV[] = { nullptr };
-        context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+        ID3D11UnorderedAccessView* nullUAVs2[] = { nullptr, nullptr };
+        context->CSSetUnorderedAccessViews(0, 2, nullUAVs2, nullptr);
 
         pass_index++;
         total_accum_samples += samples_per_frame;
 
         // Pass 2:トーンマップ&画面転送（DisplayCS）
         dispData.total_samples = total_accum_samples;
+        dispData.is_camera_moving = camera_moved ? 1 : 0;
+        dispData.view_proj_prev = view_proj_previous;   // 前フレームの行列
         context->UpdateSubresource(displayBuffer.Get(), 0, nullptr, &dispData, 0, 0);
 
         context->CSSetShader(displayShader.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* dispSrvs[] = { accumSRV.Get() };
-        context->CSSetShaderResources(0, 1, dispSrvs);
+
+        // SRV: t0=Accum, t1=History, t2=WorldPos
+        // SRV には Read 用のインデックスを指定
+        ID3D11ShaderResourceView* dispSrvs[] = { accumSRV.Get(), historySRVs[history_read_idx].Get(), worldPosSRV.Get()};
+        context->CSSetShaderResources(0, 3, dispSrvs);
+
         ID3D11Buffer* dispCbs[] = { displayBuffer.Get() };
         context->CSSetConstantBuffers(0, 1, dispCbs);
-        ID3D11UnorderedAccessView* bbUavs[] = { backBufferUAV.Get() };
-        context->CSSetUnorderedAccessViews(0, 1, bbUavs, nullptr);
+        
+        // UAV: u0=BackBuffer, u1=History (更新用)
+        // UAV には Write 用のインデックスを指定（完全分離により衝突解消）
+        ID3D11UnorderedAccessView* dispUavs[] = { backBufferUAV.Get(), historyUAVs[history_write_idx].Get()};
+        context->CSSetUnorderedAccessViews(0, 2, dispUavs, nullptr);
 
         context->Dispatch(dispatchX, dispatchY, 1);
 
         // リソース解除
-        context->CSSetShaderResources(0, 1, (ID3D11ShaderResourceView* const*)nullUAV);
-        context->CSSetUnorderedAccessViews(0, 1, nullUAV, nullptr);
+        ID3D11ShaderResourceView* nullSrvs3[] = { nullptr, nullptr , nullptr };
+        context->CSSetShaderResources(0, 3, nullSrvs3);
+        context->CSSetUnorderedAccessViews(0, 2, nullUAVs2, nullptr);
 
         // 画面フリップ（垂直同期: 1, 即時描画:0）
         swapChain->Present(1, 0);
+
+        // 行列の保存
+        view_proj_previous = view_proj_current;
+        std::swap(history_read_idx, history_write_idx);
     }
 
     return 0;
