@@ -162,9 +162,10 @@ float3 onb_local(ONB onb, float3 a)
     return a.x * onb.u + a.y * onb.v + a.z * onb.w;
 }
 
-// 出力先UAVの定義（UAV:u0 WorldPos:u1）
-RWTexture2D<float4> OutputTexture : register(u0);
+// 出力先UAVの定義（UAV:u0 WorldPos:u1 Normal:u2）
+RWTexture2D<float4> OutputTexture   : register(u0);
 RWTexture2D<float4> WorldPosTexture : register(u1);
+RWTexture2D<float4> NormalTexture   : register(u2); // 法線(xyz)とアルベド輝度(w)
 // C++から転送された球体バッファ(t0)とBVHノードバッファ(t1)
 StructuredBuffer<Sphere> Spheres : register(t0);
 StructuredBuffer<BvhNode> BvhNodes : register(t1);
@@ -876,8 +877,10 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     pcg_hash(rng);
 
     float3 pass_color = float3(0.0f, 0.0f, 0.0f);
-// 初期値は原点(0,0,0)ではなく遠方の仮想座標にして床との誤認を防止
+    // 初期値は原点(0,0,0)ではなく遠方の仮想座標にして床との誤認を防止
     float3 first_hit_pos = CameraCenter + 1000.0f * (Pixel00Loc - CameraCenter);
+    float3 first_hit_normal = float3(0.0f, 1.0f, 0.0f);
+    float first_hit_albedo_lum = 0.5f;
     int is_first_hit_specular = 0;  // 鏡面フラグ
     
     // マルチサンプリング（アンチエイリアス）ループ
@@ -918,6 +921,11 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 if (bounce == 0 && s == 0)
                 {
                     first_hit_pos = rec.p;
+                    first_hit_normal = rec.normal;
+                    // マテリアルのアルベド輝度を計算（チェッカー境界保護用）
+                    float3 alb = get_material_albedo(rec.mat, rec.p, rec.uv);
+                    // 人間が感じる「明るさ（輝度：Luminance）」を算出するための標準的な重み係数（ITU-R BT.601 規格）
+                    first_hit_albedo_lum = dot(alb, float3(0.299f, 0.587f, 0.114f));
                     is_first_hit_specular = (rec.mat.type == 1 || rec.mat.type == 2);
                 }
                 
@@ -1032,9 +1040,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // 線形色（リニアカラー）のまま出力バッファへ書き込む
     OutputTexture[id.xy] = float4(prev_color + pass_color, 1.0f);
     
-    // ワールド座標の書き込み（カメラ移動・パスリセット時のみ更新すれば十分
-    //if (PassIndex == 0)
-    {
-        WorldPosTexture[id.xy] = float4(first_hit_pos, (float) is_first_hit_specular);
-    }
+    // ワールド座標の書き込み
+    WorldPosTexture[id.xy] = float4(first_hit_pos, (float) is_first_hit_specular);
+    
+    // 法線とアルベド輝度を出力
+    NormalTexture[id.xy] = float4(first_hit_normal, first_hit_albedo_lum);
 }

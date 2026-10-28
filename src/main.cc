@@ -1260,6 +1260,13 @@ struct DisplayBufferData {
     mat4 view_proj_prev;    // 前フレームのView-Projection行列
 };
 
+// DenoniseCS用の定数バッファ
+struct DenoiseBufferData {
+    int total_samples;
+    int is_camera_moving;
+    float pad[2];
+};
+
 int run_realtime_renderer(const SceneConfig& sc) {
     // 1.Win32 ウィンドウの作成
     HINSTANCE hInstance = GetModuleHandle(nullptr);
@@ -1319,17 +1326,36 @@ int run_realtime_renderer(const SceneConfig& sc) {
 
     // 3.ComputeShaderのコンパイル
     UINT compileFlags = D3DCOMPILE_OPTIMIZATION_LEVEL3;
-    ComPtr<ID3DBlob> blobRay, blobDisplay, errorBlob;
+#ifdef _DEBUG
+    compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#endif
 
-    // レイトレ本体
-    CheckHR(D3DCompileFromFile(L"shader/RayTracingCS.hlsl", nullptr, nullptr, "CSMain", "cs_5_0", compileFlags, 0, &blobRay, &errorBlob));
-    ComPtr<ID3D11ComputeShader> rayShader;
-    CheckHR(device->CreateComputeShader(blobRay->GetBufferPointer(), blobRay->GetBufferSize(), nullptr, &rayShader));
+    auto compile_shader = [&](const wchar_t* path, ComPtr<ID3DBlob>& outBlob, ComPtr<ID3D11ComputeShader>& outShader) {
+        ComPtr<ID3DBlob> errorBlob;
+        HRESULT hr = D3DCompileFromFile(path, nullptr, nullptr, "CSMain", "cs_5_0", compileFlags, 0, &outBlob, &errorBlob);
+        if (FAILED(hr)) {
+            std::string msg = "Shader Error in : ";
+            char pathA[MAX_PATH];
+            wcstombs(pathA, path, MAX_PATH);
+            msg += pathA;
+            if (errorBlob) {
+                msg += "\n\n";
+                msg.append(static_cast<const char*>(errorBlob->GetBufferPointer()), errorBlob->GetBufferSize());
+            }
+            MessageBoxA(nullptr, msg.c_str(), "Shader Compilation Failed", MB_ICONERROR | MB_OK);
+            std::cerr << msg << std::endl;
+            throw std::runtime_error(msg);
+        }
+        CheckHR(device->CreateComputeShader(outBlob->GetBufferPointer(), outBlob->GetBufferSize(), nullptr, &outShader));
+    };
 
-    // 表示用ポストプロセス
-    CheckHR(D3DCompileFromFile(L"shader/DisplayCS.hlsl", nullptr, nullptr, "CSMain", "cs_5_0", compileFlags, 0, &blobDisplay, &errorBlob));
-    ComPtr<ID3D11ComputeShader> displayShader;
-    CheckHR(device->CreateComputeShader(blobDisplay->GetBufferPointer(), blobDisplay->GetBufferSize(), nullptr, &displayShader));
+    ComPtr<ID3DBlob> blobRay, blobDisplay, blobDenoise;
+    ComPtr<ID3D11ComputeShader> rayShader, displayShader, denoiseShader;
+
+    // シェーダーコンパイル
+    compile_shader(L"shader/RayTracingCS.hlsl", blobRay, rayShader);
+    compile_shader(L"shader/DisplayCS.hlsl", blobDisplay, displayShader);
+    compile_shader(L"shader/DenoiseCS.hlsl", blobDenoise, denoiseShader);
 
     // 4. シーンバッファとBVHの構築 (既存ロジックを流用)
     std::vector<PrimitiveRef> prim_refs;
@@ -1403,6 +1429,22 @@ int run_realtime_renderer(const SceneConfig& sc) {
     int history_read_idx = 0;
     int history_write_idx = 1;
 
+    // 法線テクスチャ
+    ComPtr<ID3D11Texture2D> normalTexture;
+    ComPtr<ID3D11UnorderedAccessView> normalUAV;
+    ComPtr<ID3D11ShaderResourceView> normalSRV;
+    CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &normalTexture));
+    CheckHR(device->CreateUnorderedAccessView(normalTexture.Get(), nullptr, &normalUAV));
+    CheckHR(device->CreateShaderResourceView(normalTexture.Get(), nullptr, &normalSRV));
+
+    // デノイズ済みテクスチャ
+    ComPtr<ID3D11Texture2D> denoisedTexture;
+    ComPtr<ID3D11UnorderedAccessView> denoisedUAV;
+    ComPtr<ID3D11ShaderResourceView> denoisedSRV;
+    CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &denoisedTexture));
+    CheckHR(device->CreateUnorderedAccessView(denoisedTexture.Get(), nullptr, &denoisedUAV));
+    CheckHR(device->CreateShaderResourceView(denoisedTexture.Get(), nullptr, &denoisedSRV));
+
     // 6. 定数バッファの作成
     CameraBufferData cbData = {};
     sc.background.copy_to(cbData.background);
@@ -1427,6 +1469,11 @@ int run_realtime_renderer(const SceneConfig& sc) {
     D3D11_BUFFER_DESC dispDesc = { sizeof(DisplayBufferData), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
     ComPtr<ID3D11Buffer> displayBuffer;
     CheckHR(device->CreateBuffer(&dispDesc, nullptr, &displayBuffer));
+
+    DenoiseBufferData denoiseData = {};
+    D3D11_BUFFER_DESC denoiseDesc = { sizeof(DenoiseBufferData), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0 };
+    ComPtr<ID3D11Buffer> denoiseBuffer;
+    CheckHR(device->CreateBuffer(&denoiseDesc, nullptr, &denoiseBuffer));
 
     // 7.インタラクティブ・カメラの初期化
     FpsCamera camera(sc.lookfrom, sc.lookat, sc.vfov);
@@ -1559,28 +1606,56 @@ int run_realtime_renderer(const SceneConfig& sc) {
 
         context->UpdateSubresource(cameraBuffer.Get(), 0, nullptr, &cbData, 0, 0);
 
+        // =====================================================================
         // Pass 1:レイトレーシング計算（RayTracingCS）
+        // =====================================================================
         context->CSSetShader(rayShader.Get(), nullptr, 0);
         ID3D11ShaderResourceView* srvs[] = { sphereSRV.Get(), bvhSRV.Get(), imageSRV.Get(), quadSRV.Get(), volSRV.Get() };
         context->CSSetShaderResources(0, 5, srvs);
-
         ID3D11Buffer* cbs[] = { cameraBuffer.Get() };
         context->CSSetConstantBuffers(0, 1, cbs);
 
         // 現在フレームの書き込み先として worldPosUAVs[history_write_idx] を渡す
-        ID3D11UnorderedAccessView* rayUavs[] = { accumUAV.Get(), worldPosUAVs[history_write_idx].Get()};
-        context->CSSetUnorderedAccessViews(0, 2, rayUavs, nullptr);
+        // u0: Accum, u1: WorldPos, u2: Normal
+        ID3D11UnorderedAccessView* rayUavs[] = { accumUAV.Get(), worldPosUAVs[history_write_idx].Get(), normalUAV.Get() };
+        context->CSSetUnorderedAccessViews(0, 3, rayUavs, nullptr);
 
         context->Dispatch(dispatchX, dispatchY, 1);
 
-        // UAVアンバインド(Pass2でSRVとして読むため)
-        ID3D11UnorderedAccessView* nullUAVs2[] = { nullptr, nullptr };
-        context->CSSetUnorderedAccessViews(0, 2, nullUAVs2, nullptr);
+        // UAVアンバインド (3スロット)
+        ID3D11UnorderedAccessView* nullUAVs3[] = { nullptr, nullptr, nullptr };
+        context->CSSetUnorderedAccessViews(0, 3, nullUAVs3, nullptr);
 
         pass_index++;
         total_accum_samples += samples_per_frame;
 
+        // =====================================================================
+        // Pass 1.5:空間クロスバイラテラルフィルタ (DenoiseCS)
+        // =====================================================================
+        denoiseData.total_samples = total_accum_samples;
+        denoiseData.is_camera_moving = camera_moved ? 1: 0;
+        context->UpdateSubresource(denoiseBuffer.Get(), 0, nullptr, &denoiseData, 0, 0);
+
+        context->CSSetShader(denoiseShader.Get(), nullptr, 0);
+        // t0: Accum(生光量), t1: WorldPos(座標), t2: Normal(法線・アルベド)
+        ID3D11ShaderResourceView* denoiseSrvs[] = { accumSRV.Get(), worldPosSRVs[history_write_idx].Get(), normalSRV.Get() };
+        context->CSSetShaderResources(0, 3, denoiseSrvs);
+        ID3D11Buffer* denoiseCbs[] = { denoiseBuffer.Get() };
+        context->CSSetConstantBuffers(0, 1, denoiseCbs);
+        ID3D11UnorderedAccessView* denoiseUavs[] = { denoisedUAV.Get() };
+        context->CSSetUnorderedAccessViews(0,1, denoiseUavs, nullptr);
+
+        context->Dispatch(dispatchX, dispatchY, 1);
+
+        // リソース解除
+        ID3D11ShaderResourceView* nullSrvs3[] = { nullptr,nullptr,nullptr };
+        context->CSSetShaderResources(0, 3, nullSrvs3);
+        ID3D11UnorderedAccessView* nullUAVs1[] = { nullptr };
+        context->CSSetUnorderedAccessViews(0, 1, nullUAVs1, nullptr);
+
+        // =====================================================================
         // Pass 2:トーンマップ&画面転送（DisplayCS）
+        // =====================================================================
         dispData.total_samples = total_accum_samples;
         dispData.is_camera_moving = camera_moved ? 1 : 0;
         dispData.view_proj_prev = view_proj_previous;   // 前フレームの行列
@@ -1588,10 +1663,10 @@ int run_realtime_renderer(const SceneConfig& sc) {
 
         context->CSSetShader(displayShader.Get(), nullptr, 0);
 
-        // SRV に新旧両方の座標テクスチャを渡す
-        // t0: Accum, t1: History(過去色), t2: 現フレーム座標, t3: 前フレーム座標
+        // SRV にデノイズ済みのSRVを渡す。新旧両方の座標テクスチャを渡す
+        // t0: Denoised, t1: History(過去色), t2: 現フレーム座標, t3: 前フレーム座標
         ID3D11ShaderResourceView* dispSrvs[] = {
-            accumSRV.Get(),
+            denoisedSRV.Get(),  // accumSRVからdenoisedSRVへ
             historySRVs[history_read_idx].Get(),
             worldPosSRVs[history_write_idx].Get(),
             worldPosSRVs[history_read_idx].Get()
@@ -1611,6 +1686,7 @@ int run_realtime_renderer(const SceneConfig& sc) {
         // リソース解除
         ID3D11ShaderResourceView* nullSrvs4[] = { nullptr, nullptr , nullptr, nullptr };
         context->CSSetShaderResources(0, 4, nullSrvs4);
+        ID3D11UnorderedAccessView* nullUAVs2[] = { nullptr, nullptr };
         context->CSSetUnorderedAccessViews(0, 2, nullUAVs2, nullptr);
 
         // 画面フリップ（垂直同期: 1, 即時描画:0）

@@ -30,7 +30,8 @@ set ( SOURCE_CPP
 
 set ( SOURCE_SHADER
  src/shader/RayTracingCS.hlsl
- src/shader/DisplayCS.hlsl 
+ src/shader/DisplayCS.hlsl
+ src/shader/DenoiseCS.hlsl 
 )
 
 # シェーダー群をVSの事前コンパイルから一括除外
