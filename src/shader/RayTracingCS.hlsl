@@ -876,7 +876,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     pcg_hash(rng);
 
     float3 pass_color = float3(0.0f, 0.0f, 0.0f);
-    float3 first_hit_pos = float3(0.0f, 0.0f, 0.0f);
+// 初期値は原点(0,0,0)ではなく遠方の仮想座標にして床との誤認を防止
+    float3 first_hit_pos = CameraCenter + 1000.0f * (Pixel00Loc - CameraCenter);
+    int is_first_hit_specular = 0;  // 鏡面フラグ
     
     // マルチサンプリング（アンチエイリアス）ループ
     for (int s = 0; s < SamplesThisPass; ++s)
@@ -916,6 +918,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
                 if (bounce == 0 && s == 0)
                 {
                     first_hit_pos = rec.p;
+                    is_first_hit_specular = (rec.mat.type == 1 || rec.mat.type == 2);
                 }
                 
                 // マテリアルの発光成分を加算
@@ -1032,6 +1035,6 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // ワールド座標の書き込み（カメラ移動・パスリセット時のみ更新すれば十分
     //if (PassIndex == 0)
     {
-        WorldPosTexture[id.xy] = float4(first_hit_pos, 1.0f);
+        WorldPosTexture[id.xy] = float4(first_hit_pos, (float) is_first_hit_specular);
     }
 }

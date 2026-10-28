@@ -1374,27 +1374,31 @@ int run_realtime_renderer(const SceneConfig& sc) {
     accumDesc.Usage = D3D11_USAGE_DEFAULT;
     accumDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
 
-    ComPtr<ID3D11Texture2D> accumTexture, worldPosTexture;
-    ComPtr<ID3D11UnorderedAccessView> accumUAV, worldPosUAV;
-    ComPtr<ID3D11ShaderResourceView> accumSRV, worldPosSRV;
-
+    // 蓄積テクスチャ
+    ComPtr<ID3D11Texture2D> accumTexture;
+    ComPtr<ID3D11UnorderedAccessView> accumUAV;
+    ComPtr<ID3D11ShaderResourceView> accumSRV;
     CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &accumTexture));
     CheckHR(device->CreateUnorderedAccessView(accumTexture.Get(), nullptr, &accumUAV));
     CheckHR(device->CreateShaderResourceView(accumTexture.Get(), nullptr, &accumSRV));
 
-    // ワールド座標G-Buffer用（RayTracingCSで書きこっみ、DisplayCSで読み込み）
-    CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &worldPosTexture));
-    CheckHR(device->CreateUnorderedAccessView(worldPosTexture.Get(), nullptr, &worldPosUAV));
-    CheckHR(device->CreateShaderResourceView(worldPosTexture.Get(), nullptr, &worldPosSRV));
-
-    // 履歴バッファを2枚作成
+    // 履歴バッファ（History）と座標バッファ（WorldPos）を2枚作成
     ComPtr<ID3D11Texture2D> historyTextures[2];
     ComPtr<ID3D11ShaderResourceView> historySRVs[2];
     ComPtr<ID3D11UnorderedAccessView> historyUAVs[2];
+
+    ComPtr<ID3D11Texture2D> worldPosTextures[2];
+    ComPtr<ID3D11ShaderResourceView> worldPosSRVs[2];
+    ComPtr<ID3D11UnorderedAccessView> worldPosUAVs[2];
+
     for (int i = 0; i < 2; i++) {
         CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &historyTextures[i]));
         CheckHR(device->CreateShaderResourceView(historyTextures[i].Get(), nullptr, &historySRVs[i]));
         CheckHR(device->CreateUnorderedAccessView(historyTextures[i].Get(), nullptr, &historyUAVs[i]));
+
+        CheckHR(device->CreateTexture2D(&accumDesc, nullptr, &worldPosTextures[i]));
+        CheckHR(device->CreateShaderResourceView(worldPosTextures[i].Get(), nullptr, &worldPosSRVs[i]));
+        CheckHR(device->CreateUnorderedAccessView(worldPosTextures[i].Get(), nullptr, &worldPosUAVs[i]));
     }
     int history_read_idx = 0;
     int history_write_idx = 1;
@@ -1502,6 +1506,10 @@ int run_realtime_renderer(const SceneConfig& sc) {
             }
         }
 
+        // マウス回転後の最新の向きベクトルに更新
+        fwd = camera.get_forward();
+        right = camera.get_right();
+
         // 行列の計算
         vec3 eye(camera.pos.x(), camera.pos.y(), camera.pos.z());
         vec3 center = eye + fwd;
@@ -1559,8 +1567,8 @@ int run_realtime_renderer(const SceneConfig& sc) {
         ID3D11Buffer* cbs[] = { cameraBuffer.Get() };
         context->CSSetConstantBuffers(0, 1, cbs);
 
-        // UAVにworldPosUAVを追加（u1スロット）
-        ID3D11UnorderedAccessView* rayUavs[] = { accumUAV.Get(), worldPosUAV.Get()};
+        // 現在フレームの書き込み先として worldPosUAVs[history_write_idx] を渡す
+        ID3D11UnorderedAccessView* rayUavs[] = { accumUAV.Get(), worldPosUAVs[history_write_idx].Get()};
         context->CSSetUnorderedAccessViews(0, 2, rayUavs, nullptr);
 
         context->Dispatch(dispatchX, dispatchY, 1);
@@ -1580,10 +1588,15 @@ int run_realtime_renderer(const SceneConfig& sc) {
 
         context->CSSetShader(displayShader.Get(), nullptr, 0);
 
-        // SRV: t0=Accum, t1=History, t2=WorldPos
-        // SRV には Read 用のインデックスを指定
-        ID3D11ShaderResourceView* dispSrvs[] = { accumSRV.Get(), historySRVs[history_read_idx].Get(), worldPosSRV.Get()};
-        context->CSSetShaderResources(0, 3, dispSrvs);
+        // SRV に新旧両方の座標テクスチャを渡す
+        // t0: Accum, t1: History(過去色), t2: 現フレーム座標, t3: 前フレーム座標
+        ID3D11ShaderResourceView* dispSrvs[] = {
+            accumSRV.Get(),
+            historySRVs[history_read_idx].Get(),
+            worldPosSRVs[history_write_idx].Get(),
+            worldPosSRVs[history_read_idx].Get()
+        };
+        context->CSSetShaderResources(0, 4, dispSrvs);
 
         ID3D11Buffer* dispCbs[] = { displayBuffer.Get() };
         context->CSSetConstantBuffers(0, 1, dispCbs);
@@ -1596,8 +1609,8 @@ int run_realtime_renderer(const SceneConfig& sc) {
         context->Dispatch(dispatchX, dispatchY, 1);
 
         // リソース解除
-        ID3D11ShaderResourceView* nullSrvs3[] = { nullptr, nullptr , nullptr };
-        context->CSSetShaderResources(0, 3, nullSrvs3);
+        ID3D11ShaderResourceView* nullSrvs4[] = { nullptr, nullptr , nullptr, nullptr };
+        context->CSSetShaderResources(0, 4, nullSrvs4);
         context->CSSetUnorderedAccessViews(0, 2, nullUAVs2, nullptr);
 
         // 画面フリップ（垂直同期: 1, 即時描画:0）
