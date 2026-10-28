@@ -12,6 +12,11 @@ cbuffer DenoiseBuffer : register(b0)
     float2 Pad;
 }
 
+float calc_albedo(float3 alb)
+{
+    return dot(alb, float3(0.299f, 0.587f, 0.114f));
+}
+
 [numthreads(16, 16, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -22,7 +27,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     
     // 現在の中心ピクセルの生光量
     float3 center_color = ColorTexture[id.xy].rgb;
-
+    float center_lum = calc_albedo(center_color);
+    
     float4 g_pos = WorldPosTexture[id.xy];
     float3 pos0 = g_pos.xyz;
     float spec0 = g_pos.w;      // 1.0:鏡/ガラス, 0.0:ディフューズ
@@ -33,29 +39,13 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     
     // 鏡・ガラス球は像が複雑なためフィルタ半径を絞る
     int radius = (spec0 > 0.5f) ? 1 : 2;    // ディフューズ面は5x5、鏡面は3x3
-    
-    // ---------------------------------------------------------------------
-    // 【モザイク防止 1】周囲の輝度中央値/平均によるホタルノイズ（Firefly）の抑制
-    // 孤立した極端な光点が5x5のモザイクブロックに拡大されるのを防止
-    // ---------------------------------------------------------------------
-    float3 local_sum = float3(0.0f, 0.0f, 0.0f);
-    for (int sy = -1; sy <= 1; ++sy)
-    {
-        for (int sx = -1; sx <= 1; ++sx)
-        {
-            int2 sc = clamp(int2(id.xy) + int2(sx, sy), int2(0, 0), int2(width - 1, height - 1));
-            local_sum += ColorTexture[sc].rgb;
-        }
-    }
-    float3 local_avg = local_sum / 9.0f;
-    // 周囲平均の4倍を超える異常光点をクランプ（モザイク状の四角い塊の発生を遮断）
-    float3 max_allowed = max(local_avg * 4.0f, float3(0.5f, 0.5f, 0.5f));
+
     float3 accum_color = float3(0.0f, 0.0f, 0.0f);
     float accum_weight = 0.0f;
     
     // フィルタパラメータ
-    const float sigma_spatial = 1.5f;
-    const float sigma_plane = 0.03f;    // 平面からのずれ許容値(3cm)
+    const float sigma_spatial = 1.4f;
+    const float sigma_plane = 0.04f;    // 平面からのずれ許容値(4cm)
     
     [unroll]
     for (int dy = -2; dy <= 2; ++dy)
@@ -69,7 +59,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             int2 sample_coord = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), int2(width - 1, height - 1));
             
             // クランプ済みの色を使用
-            float3 c_i = min(ColorTexture[sample_coord].rgb, max_allowed);
+            float3 c_i = ColorTexture[sample_coord].rgb;
             float4 p_i = WorldPosTexture[sample_coord];
             float4 n_i = NormalTexture[sample_coord];
 
@@ -90,12 +80,18 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             float lum_diff = abs(lum0 - n_i.w);
             float w_albedo = exp(-lum_diff / 0.15f);
 
-            // 鏡面同士・非鏡面同士の一致度重み
+            // 5. 鏡面・非鏡面の一致度重み
             float spec_diff = abs(spec0 - p_i.w);
             float w_spec = exp(-spec_diff / 0.2f);
             
+            // 6.輝度差に応じた相対重み
+            // 孤立した強烈な交点が周囲に四角いブロックとして張り付くのを禁止
+            float sample_lum = calc_albedo(c_i);
+            float lum_ratio = abs(center_lum - sample_lum) / max(0.1f, max(center_lum, sample_lum));
+            float w_lum = exp(-lum_ratio * 0.5f);
+
             // 総合重み
-            float weight = w_spatial * w_normal * w_plane * w_albedo * w_spec;
+            float weight = w_spatial * w_normal * w_plane * w_albedo * w_spec * w_lum;
             
             accum_color += c_i * weight;
             accum_weight += weight;
