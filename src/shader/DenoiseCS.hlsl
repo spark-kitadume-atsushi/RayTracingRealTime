@@ -22,15 +22,7 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     
     // 現在の中心ピクセルの生光量
     float3 center_color = ColorTexture[id.xy].rgb;
-    
-    // 静止中で既に十分なサンプル数(64)が集まっている場合は、ボケを避けるためにスルーパス
-    const int SUFFICIENT_SAMPLES = 64;
-    if (IsCameraMoving == 0 && TotalSamples >= SUFFICIENT_SAMPLES)
-    {
-        DenoisedTexture[id.xy] = float4(center_color, 1.0f);
-        return;
-    }
-    
+
     float4 g_pos = WorldPosTexture[id.xy];
     float3 pos0 = g_pos.xyz;
     float spec0 = g_pos.w;      // 1.0:鏡/ガラス, 0.0:ディフューズ
@@ -42,6 +34,22 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // 鏡・ガラス球は像が複雑なためフィルタ半径を絞る
     int radius = (spec0 > 0.5f) ? 1 : 2;    // ディフューズ面は5x5、鏡面は3x3
     
+    // ---------------------------------------------------------------------
+    // 【モザイク防止 1】周囲の輝度中央値/平均によるホタルノイズ（Firefly）の抑制
+    // 孤立した極端な光点が5x5のモザイクブロックに拡大されるのを防止
+    // ---------------------------------------------------------------------
+    float3 local_sum = float3(0.0f, 0.0f, 0.0f);
+    for (int sy = -1; sy <= 1; ++sy)
+    {
+        for (int sx = -1; sx <= 1; ++sx)
+        {
+            int2 sc = clamp(int2(id.xy) + int2(sx, sy), int2(0, 0), int2(width - 1, height - 1));
+            local_sum += ColorTexture[sc].rgb;
+        }
+    }
+    float3 local_avg = local_sum / 9.0f;
+    // 周囲平均の4倍を超える異常光点をクランプ（モザイク状の四角い塊の発生を遮断）
+    float3 max_allowed = max(local_avg * 4.0f, float3(0.5f, 0.5f, 0.5f));
     float3 accum_color = float3(0.0f, 0.0f, 0.0f);
     float accum_weight = 0.0f;
     
@@ -60,7 +68,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             
             int2 sample_coord = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), int2(width - 1, height - 1));
             
-            float3 c_i = ColorTexture[sample_coord].rgb;
+            // クランプ済みの色を使用
+            float3 c_i = min(ColorTexture[sample_coord].rgb, max_allowed);
             float4 p_i = WorldPosTexture[sample_coord];
             float4 n_i = NormalTexture[sample_coord];
 
@@ -76,12 +85,14 @@ void CSMain(uint3 id : SV_DispatchThreadID)
             float plane_dist = abs(dot(norm0, p_i.xyz - pos0));
             float w_plane = exp(-plane_dist / sigma_plane);
 
-            // 4.アルベド一致重み（チェッカータイルの白と黒の境目を完全保護）
+            // 4.アルベド輝度差重み (チェッカー境界を保護しつつ滑らかに減衰)
+            // 二値判定(0/1)を撤廃し、滑らかな指数減衰に統一
             float lum_diff = abs(lum0 - n_i.w);
-            float w_albedo = (lum_diff < 0.1f) ? 1.0f: 0.0f;
+            float w_albedo = exp(-lum_diff / 0.15f);
 
-            // 鏡面同士・非鏡面同士のみブレンド
-            float w_spec = (abs(spec0 - p_i.w) < 0.5f) ? 1.0f: 0.0f;
+            // 鏡面同士・非鏡面同士の一致度重み
+            float spec_diff = abs(spec0 - p_i.w);
+            float w_spec = exp(-spec_diff / 0.2f);
             
             // 総合重み
             float weight = w_spatial * w_normal * w_plane * w_albedo * w_spec;
